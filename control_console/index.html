@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!-- 
+The xmlns prop for html is critical for the svg to work correctly.
+See:
+https://developer.mozilla.org/en-US/docs/Web/SVG/Tutorial/SVG_In_HTML_Introduction
+-->
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="utf-8">
+    <title>Connecting ...</title>
+    <link rel="stylesheet" href="css/main.css">
+    <script src="js/lang_packs.js"></script>
+    <script src="js/main.js"></script>
+  </head>
+  <body>
+    <div id="message"></div>
+    <div id="display">
+      <div>
+	<table>
+	  <thead id="tbr_header">
+	    <tr>
+	      <td>name</td>
+	      <td>origin</td>
+	    </tr>
+	  </thead>
+	  <tbody id="branches"></tbody>
+	</table>
+      </div>
+      <div>
+	<table>
+	  <thead id="tsnp_header">
+	    <tr>
+	      <td>name</td>
+	      <td>creation</td>
+	    </tr>
+	  </thead>
+	  <tbody id="snaps"></tbody>
+	</table>
+      </div>
+      <div id="details">
+	<div id="sn_switch">
+	  <span data-idx="0">
+	    svg
+	  </span>
+	  <span data-idx="1">
+	    note
+	  </span>
+	</div>
+	<div>
+	  <div id="svg_box"></div>
+	  <div id="note_box"></div>
+	</div>
+      </div>
+    </div>
+    <div id="button_row">
+      <button id="rbutton" type="button"></button>
+      <button id="lbutton" type="button"></button>
+    </div>
+    <div id="session" class="debug"></div>
+    <div class="debug">
+      <div id="returncode"></div>
+      <textarea id="stdout"></textarea>
+      <textarea id="stderr"></textarea>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,296 @@
+#!/usr/bin/python3
+
+# CDDL HEADER START
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://www.opensource.org/licenses/CDDL-1.0
+#
+# CDDL HEADER END
+#
+# Copyright (C) 2019 Xiao Wan
+
+import argparse
+import http.server
+import sys
+import subprocess
+import random
+
+from time import time as now, sleep
+from json import dumps as json_dump, loads as json_parse
+from json.decoder import JSONDecodeError
+from urllib.parse import quote as percent_encode, unquote as percent_decode
+from http import HTTPStatus
+from subprocess import run as run_process, PIPE, CalledProcessError
+
+# maintains a session; only allows one browser window/tab to connect at a time
+# SessionInVar: want to maintain the invariance that the client never sees
+#               an unexpired session that the server sees as unrenewable
+# assuming the clocks run at comparable rates on server and client
+# -- need to add syncing for serious cross network use
+class SingleSessionHTTPServer(http.server.HTTPServer):
+    class Session:
+        # grace: in seconds
+        #        -- to allow room for network and computation delay and
+        #        protect against the server's clock running too fast
+        def __init__(self, grace=5):
+            self.seq = 0
+            self.__reset()
+            self.grace = grace 
+            self.rnd = random.Random()
+
+        def __reset(self):
+            self.token = ''
+            self.expiry = 0 # already expired
+            self.storage = None
+
+        def expired(self):
+            return now() > self.expiry
+
+        def unrenewable(self):
+            return now() > self.expiry + self.grace
+            
+        def authed(self, seq:int, token:str):
+            return False if not self.token else (seq == self.seq and
+                                                 token == self.token)
+
+        # ts: client's clock
+        # -- so that can return new expiry by client's clock (same for renew())
+        def init(self, ts:float, dur:float):
+            if self.unrenewable():
+                self.seq += 1
+                self.token = '%040x' % self.rnd.randint(0,(16**40)-1)
+                self.expiry = now()+dur
+                self.storage = {}
+                return True, self.seq, self.token
+            else:
+                return False, self.seq, ''
+
+        def fini(self, seq:int, token:str):
+            if self.authed(seq, token):
+                self.__reset()
+                return True
+            else:
+                return False
+
+        def renew(self, seq:int, token:str, ts:float, dur:float):
+            if self.unrenewable():
+                self.__reset()
+                return False, 0
+            if self.authed(seq, token):
+                self.expiry = now()+dur
+                return True, self.seq
+            else:
+                return False, self.seq
+
+        def read(self, seq:int, token:str, key:str):
+            if self.unrenewable():
+                self.__reset()
+                return False, ''
+            # still allow reading even if expired?
+            if self.authed(seq, token):
+                return True,self.storage[key]
+            else:
+                return False,''
+
+        def write(self, seq:int, token:str, key:str, val:str):
+            if self.unrenewable():
+                self.__reset()
+                return False
+            if self.expired():
+                return False
+            if self.authed(seq, token):
+                self.storage[key] = val
+                return True
+            else:
+                return False
+
+        def who(self):
+            if self.unrenewable():
+                self.__reset()
+                return 0
+            else:
+                return self.seq
+        
+    def __init__(self, server_address, RequestHandlerClass):
+        super().__init__(server_address, RequestHandlerClass)
+        self.session = self.Session()
+    
+
+class SpecialHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    # do it right:
+    # use POST to handle ajax queries, and keep SimpleHTTPRequestHandler's do_GET 
+    def do_POST(self):
+        length = self.headers.get('content-length')
+        try:
+            nbytes = int(length)
+        except (TypeError, ValueError) as e:
+            self.log_message(e.__repr__())
+            self.try_send_error(HTTPStatus.BAD_REQUEST, "Bad request")
+            return
+        # if nbyte > actual length:
+        #   rfile.read blocks until the connection is closed (say, by ajax.open)
+        #   -- as read()'s doc says in help(io.TextIOWrapper):
+        #   "Read from underlying buffer until we have n characters or we hit EOF."
+        # otherwise:
+        #   rfile.read gets truncated data
+        try:
+            data = self.rfile.read(nbytes)
+        except BrokenPipeError as e:
+            self.log_message(e.__repr__())
+            return
+        try:
+            inpack = json_parse(data.decode('utf-8'))
+        except JSONDecodeError as e:
+            self.log_message(e.__repr__())
+            self.try_send_error(HTTPStatus.BAD_REQUEST, "Bad request")
+            return
+        
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        outpack = {}
+
+        try:
+            seq = int(inpack['seq'])
+            token = str(inpack['token'])
+            ts = float(inpack['ts'])
+            dur = float(inpack['dur'])
+            op = str(inpack['op'])
+            if op=='exec':
+                if type(inpack['args']) is list:
+                    args = inpack['args']
+                else:
+                    raise ValueError('args is not list')
+        except (ValueError, KeyError) as e:
+            self.log_message(e.__repr__())
+            self.try_send_error(HTTPStatus.BAD_REQUEST, "Bad request")
+            return
+        if seq == 0:
+            success = self.init_session(outpack, ts, dur)
+        elif op == 'fini':
+            success = self.fini_session(seq, token)
+            self.log_message('fini_session %s!'%('success' if success else 'fail'))
+            return                
+        else:
+            success = self.renew_session(outpack, seq, token, ts, dur)
+        if success and op == 'exec':
+            self.log_message('exec on %s', args)
+            try:
+                # https://serverfault.com/questions/825264/freebsd-10-3-zfs-character-set-incorrectly-displayed-in-terminal
+                # but let's say I only use utf-8 encoded file names:
+                done_proc = run_process(['/bin/bash']+args, stdout=PIPE, stderr=PIPE, check=True)
+            except CalledProcessError as e:
+                outpack['returncode'] = e.returncode
+                outpack['stderr'] = e.stderr.decode('utf-8')
+                outpack['stdout'] = e.stdout.decode('utf-8')
+            else:
+                outpack['returncode'] = done_proc.returncode
+                outpack['stderr'] = done_proc.stderr.decode('utf-8')
+                outpack['stdout'] = done_proc.stdout.decode('utf-8')
+            self.log_message('exec done with returncode %d of lengths: stdout %d, stderr %d',
+                         outpack["returncode"],
+                         len(outpack["stdout"]),
+                         len(outpack["stderr"]))
+        try:
+            self.wfile.write(json_dump(outpack).encode('utf-8'))
+        except BrokenPipeError as e:
+            self.log_message(e.__repr__())
+        # BaseHTTPRequestHandler.handle_one_request() then calls self.wfile.flush() at server.py L411
+
+    def init_session(self, outpack, ts, dur):
+        success, seq, token = self.server.session.init(ts, dur)
+        if success:
+            outpack['session'] = 1
+            outpack['seq'] = seq
+            outpack['token'] = token
+            outpack['expiry'] = ts+dur
+            return True
+        else:
+            outpack['session'] = 0
+            outpack['who'] = seq
+            return False
+
+    def renew_session(self, outpack, seq, token, ts, dur):
+        success, who = self.server.session.renew(seq, token, ts, dur)
+        if not success:
+            if who == 0:
+                return self.init_session(outpack, ts, dur)
+            else:
+                outpack['session'] = 0
+                outpack['who'] = who
+                return False
+        else:
+            outpack['session'] = 1
+            outpack['expiry'] = ts+dur
+            return True
+
+    def fini_session(self, seq, token):
+        return self.server.session.fini(seq, token)
+
+    def try_send_error(self, code, message=None, explain=None):
+        try:
+            self.send_error(code, message, explain)
+        except BrokenPipeError as e:
+            # self.wfile.write in send_error might trigger BrokenPipeError
+            self.log_message(e.__repr__())
+
+
+    # copied from server.py;
+    # added client_address checking
+    # added logging to record each handling and show when handle() returns
+    def handle(self):
+        """Handle multiple requests if necessary."""
+        self.close_connection = True
+
+        if self.client_address[0] != '127.0.0.1':
+            self.log_message('Got unknown connection from: %s, returning ...',
+                             self.client_address)
+            return
+        self.handle_one_request()
+        while not self.close_connection:
+            self.handle_one_request()
+            
+        
+# no point using keep-alive, so back to HTTP/1.0
+def run(HandlerClass=http.server.BaseHTTPRequestHandler,
+         ServerClass=http.server.HTTPServer, protocol="HTTP/1.0", port=8000, bind=""):
+    """
+
+    This runs an HTTP server on port 8000 (or the port argument).
+
+    """
+    server_address = (bind, port)
+
+    HandlerClass.protocol_version = protocol
+    httpd = ServerClass(server_address, HandlerClass)
+
+    sa = httpd.socket.getsockname()
+    print("Serving HTTP on", sa[0], "port", sa[1], "...")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received, exiting.")
+        httpd.server_close()
+        sys.exit(0)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bind', '-b', default='', metavar='ADDRESS',
+                        help='Specify alternate bind address '
+                             '[default: all interfaces]')
+    parser.add_argument('port', action='store',
+                        default=8000, type=int,
+                        nargs='?',
+                        help='Specify alternate port [default: 8000]')
+    args = parser.parse_args()
+    run(HandlerClass=SpecialHTTPRequestHandler,
+         ServerClass=SingleSessionHTTPServer,
+         port=args.port, bind=args.bind)
+

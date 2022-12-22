@@ -1,0 +1,1405 @@
+# CDDL HEADER START
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://www.opensource.org/licenses/CDDL-1.0
+#
+# CDDL HEADER END
+#
+# Copyright (C) 2018, 2019 Xiao Wan
+# Copyright (C) 2018 ZFS Authors (as noted below)
+
+
+# zfs_custom_boot
+
+# This script goes to:
+# /etc/initramfs-tools/scripts/
+# and gets copied by the hook:
+# /etc/initramfs-tools/hooks/zfs_custom_boot_hook
+# to:
+# ${DESTDIR}/scripts
+# where ${DESTDIR} is provided by /usr/sbin/mkinitramfs
+# -- and overwrites mountroot at line 261 of init,
+# which gets called at line 266 of init
+
+# Can handle path names with spaces
+
+
+ROOTMNT=$rootmnt # provided by init -- should be /root
+
+BDRTFS=root # root fs for builder mode sessions
+
+ZPROP_SD=local:system-data
+ZPROP_MT=local:mgmt-type # should be auto|snap|none; see also check_root_mt
+
+RBC=.zfsrb # regular branch container
+CBC=.zfscb # control branch container
+RSBC=.zfsrsb # regular session branch container
+CSBC=.zfscsb # control session branch container
+
+# No regexp in ash:
+# BMRE='rn|ra|cn|ca'
+# TSRE='[0-9]{10}'
+# shell pattern for time stamp
+TSSP=$(echo dddddddddd | sed 's,d,[0-9],g')
+
+ZFS_LIST_SNAPS="zfs list -d1 -tsnapshot -sname -Hponame"
+
+# command to create branch containers and session branches
+ZFS_CREATE="zfs create -p -o mountpoint=none"
+
+# for taking normal mode snapshots
+ZFS_LIST_PRESNAP_FSTREE="zfs list -Hproname,$ZPROP_MT -sname -tfilesystem"
+# The output is sorted so that parents appear before children.
+# However children may not immediately follow parents:
+# rpool/test
+# rpool/test again
+# rpool/test again/trial 1
+# rpool/test again/trial 2
+# rpool/test/it
+
+# for normal mode mounting
+ZFS_LIST_NPREMNT_FSTREE="zfs list -Hproname,devices,setuid,exec,$ZPROP_MT -sname -tfilesystem"
+NSCPT='BEGIN{OFS=","} {print $1,$2=="on"?"":"nodev",$3=="on"?"":"nosuid",$4=="on"?"":"noexec",$5}'
+
+# for admin mode and builder mode mounting
+ZFS_LIST_APREMNT_FSTREE="zfs list -Hproname,devices,setuid,exec -sname -tfilesystem"
+ASCPT='BEGIN{OFS=","} {print $1,$2=="on"?"":"nodev",$3=="on"?"":"nosuid",$4=="on"?"":"noexec"}'
+
+# for getting properties
+ZFS_GET="zfs get -Hpovalue"
+
+# for setting properties
+ZFS_SET="zfs set"
+
+# for taking individual snapshots
+ZFS_SNAP="zfs snapshot"
+
+# for taking recursive snapshots -- according to man zfs, it's atomic, all or none
+ZFS_RSNAP="zfs snapshot -r"
+
+# for cloning
+ZFS_CLONE="zfs clone -o mountpoint=legacy"
+
+# for mounting (assuming mountpoint=legacy)
+ZFS_MOUNT="mount -t zfs"
+
+# for unmounting (assuming mountpoint=legacy)
+ZFS_UNMOUNT='umount'
+
+# for checking if kernel/initramfs has been updated
+# (the filesystem has to be mounted for this command to work)
+ZFS_DIFF='zfs diff -H' # use 'zfs diff -FHt' if want sophisticated checks
+
+# for renaming boot file systems
+ZFS_RENAME='zfs rename'
+
+# for importing pool
+ZFS_IMPORT='zpool import -N'
+
+# for checking zpool health status
+ZFS_HEALTH='zpool list -H -o health'
+
+# for making mountpoints
+MKMP='mkdir'
+
+# the literal tab to be used as IFS
+TABIFS="$(printf '\t')"
+
+unixts() {
+    # returns: unix time stamp of now
+    printf '%010d' $(date +'%s')
+}
+
+cbpanic() {
+    # $1: msg
+    panic "ERROR: zfs_custom_boot: $1"
+}
+
+get_sd() {
+    # IN:
+    # $base
+    # $csts
+    # IN/OUT:
+    # $psbm
+    # $psts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $ncbp
+    # $ncsp
+    local sd
+    if ! sd="$($ZFS_GET $ZPROP_SD "$base")"; then
+        cbpanic "Exception at: $ZFS_GET $ZPROP_SD $base"
+        return 1
+    fi
+    
+    if [ "$sd" = - ]; then
+        set_things_up
+    else
+        parse_sd
+        validate_sd
+    fi
+}
+
+# handle first non-builder session
+set_things_up() {
+    # IN:
+    # $base
+    # OUT:
+    # $psbm
+    # $psts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $ncbp
+    # $ncsp
+    local b
+    local fsls
+        
+    psbm=builder
+    psts=0 # no one else following get_sd in mountroot should use this
+    rbp=0000000000 # expected to be -le rsp
+    rsp=0000000000 # so that next session can successfully snap this session
+    cbp=0000000000
+    csp=0000000000
+    ncbp=_
+    ncsp=_
+
+    b="$base/$BDRTFS"
+    
+    check_non_exist "$base/boot" || return 1
+    create_fs "$base/boot" || clean_up_partial_setup
+
+    if ! $ZFS_RSNAP "$b@baseline"; then
+        cbpanic "Exception at: $ZFS_RSNAP $b@baseline"
+        clean_up_partial_setup
+        return 1
+    fi
+
+    if ! fsls="$($ZFS_LIST_NPREMNT_FSTREE "$b")"; then
+        cbpanic "Exception at: $ZFS_LIST_NPREMNT_FSTREE $b"
+        clean_up_partial_setup
+        return 1
+    fi
+
+    set_things_up_for regular || clean_up_partial_setup
+    set_things_up_for control || clean_up_partial_setup
+}
+
+clean_up_partial_setup() {
+    # IN:
+    # $base
+    # $b
+    zfs destroy -R "$base/boot"
+    zfs destroy -R "$base/$RSBC"
+    zfs destroy -R "$base/$CSBC"
+    zfs destroy -R "$base/$RBC"
+    zfs destroy -R "$base/$CBC"
+    zfs destroy -R "$b@baseline"
+    return 1
+}
+
+set_things_up_for() {
+    # $1: regular|control
+    # IN:
+    # $base
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $b
+    # $fsls
+    local bc
+    local sbc
+    local branch
+    local sp
+    case $1 in
+        regular)
+            bc="$RBC"
+            sbc="$RSBC"
+            branch="$base/$RBC/$rbp"
+            sp=$rsp
+            ;;
+        control)
+            bc="$CBC"
+            sbc="$CSBC"
+            branch="$base/$CBC/$cbp"
+            sp=$csp
+            ;;
+        *)
+            cbpanic "Bug: illegal option: $1"
+            return 1
+    esac
+
+    check_non_exist "$base/$bc" || return 1
+    check_non_exist "$base/$sbc" || return 1
+
+    create_fs "$base/$bc" || return 1
+    create_fs "$base/$sbc" || return 1
+    create_fs "$base/$sbc/archive" || return 1
+
+    if ! $ZFS_SET blocked=on "$base/$sbc/archive"; then
+       cbpanic "Exception at: $ZFS_SET blocked=on $base/$sbc/archive"
+       return 1
+    fi
+
+    echo "$fsls" | while IFS="$TABIFS" read fs devices setuid exec mt; do
+        if ! $ZFS_CLONE -o devices=$devices -o setuid=$setuid \
+             -o exec=$exec -o $ZPROP_MT=$mt "$fs@baseline" "$branch${fs#$b}"; then
+            cbpanic "Exception at: $ZFS_CLONE -o devices=$devices \
+-o setuid=$setuid -o exec=$exec -o $ZPROP_MT=$mt $fs@baseline $branch${fs#$b}"
+            return 1
+            # return here works like (and can be replaced with) exit:
+            # exits the subshell but doesn't leave set_things_up_for()
+            # -- need extra handling below
+        fi
+    done
+    # extra handling
+    # -- don't need for the mounting whiles since they end the functions:
+    if [ $? = 1 ]; then return 1; fi
+
+    if ! $ZFS_SET $ZPROP_MT=auto "$branch"; then
+        cbpanic "Exception at: $ZFS_SET $ZPROP_MT=auto $branch"
+        return 1
+    fi
+    
+    if ! $ZFS_RSNAP "$branch@$sp"; then
+        cbpanic "Exception at: $ZFS_RSNAP $branch@$sp"
+        return 1
+    fi
+
+    if ! $ZFS_CLONE "$branch/boot@$sp" "$base/boot/$1"; then
+        cbpanic "Exception at: $ZFS_CLONE $branch/boot@$sp $base/boot/$1"
+        return 1
+    fi
+}
+
+check_non_exist() {
+    # $1: the fs to check
+    if zfs_exist "$1"; then
+        cbpanic "Unexpected $1 during first non-builder session"
+        return 1
+    else
+        return 0
+    fi
+}
+
+parse_sd() {
+    # IN:
+    # $sd
+    # IN/OUT:
+    # $psbm
+    # $psts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $ncbp
+    # $ncsp
+    local tail
+    psbm="${sd%%:*}"
+    tail="${sd#*:}"
+    psts="${tail%%:*}"
+    tail="${tail#*:}"
+    rbp="${tail%%:*}"
+    tail="${tail#*:}"
+    rsp="${tail%%:*}"
+    tail="${tail#*:}"
+    cbp="${tail%%:*}"
+    tail="${tail#*:}"
+    csp="${tail%%:*}"
+    tail="${tail#*:}"
+    ncbp="${tail%%:*}"
+    tail="${tail#*:}"
+    ncsp="${tail%%:*}"
+}
+
+validate_sd() {
+    # IN:
+    # $sd
+    # $csts
+    # $psbm
+    # $psts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $ncbp
+    # $ncsp
+    # $base
+    local bp sp
+    if ! { is_ts "$psts" && is_ts "$rbp" && is_ts "$rsp" && is_ts "$cbp" && is_ts "$csp"; }; then
+        cbpanic "$ZPROP_SD contains illegal values for timestamps: $sd"
+        return 1
+    fi
+    case $psbm in
+        rn|ra)
+            bp=$rbp
+            sp=$rsp
+            ;;
+        cn|ca)
+            bp=$cbp
+            sp=$csp
+            ;;
+        *)
+            cbpanic "$ZPROP_SD contains invalid bootmode: $sd"
+            return 1
+    esac
+    # enforcing strict monotonicity of snapshot names
+    if [ $csts -le $psts ]; then
+        cbpanic "unix time stamp of current session $csts is not greater than unix time stamp of previous session $psts"
+        return 1
+    fi
+    if [ $psts -lt $sp ]; then
+        cbpanic "$ZPROP_SD contains invalid timestamps: $sd
+unix time stamp of previous session $psts is less than snapshot pointer $sp"
+        return 1
+    fi
+    if [ $sp -lt $bp ]; then
+        cbpanic "$ZPROP_SD contains invalid timestamps: $sd
+snapshot pointer $sp is less than branch pointer $bp"
+        return 1
+    fi
+    if ! zfs_exist "$base/$RBC/$rbp@$rsp"; then
+        cbpanic "Does not exist: $base/$RBC/$rbp@$rsp"
+        return 1
+    fi
+    if ! zfs_exist "$base/$CBC/$cbp@$csp"; then
+        cbpanic "Does not exist: $base/$CBC/$cbp@$csp"
+        return 1
+    fi
+    # not really validating sd ... just fit them here for now
+    if ! check_root_mt "$base/$RBC/$rbp"; then
+        return 1
+    fi
+    if ! check_root_mt "$base/$CBC/$cbp"; then
+        return 1
+    fi
+    if ! check_ncbp_ncsp; then
+        return 1
+    fi
+}
+
+# enforcing local:mgmt-type=auto at the roots
+check_root_mt() {
+    # $1: the fs to check
+    local mt
+    if ! mt="$($ZFS_GET $ZPROP_MT "$1")"; then
+        cbpanic "Exception at: $ZFS_GET $ZPROP_MT $1"
+        return 1
+    fi
+    if [ "$mt" != auto ]; then
+        if ! $ZFS_SET $ZPROP_MT=auto "$1"; then
+           cbpanic "Exception at: $ZFS_SET $ZPROP_MT=auto $1"
+           return 1
+        fi
+    fi
+}
+
+is_ts() {
+    # $1: whatever
+    case "$1" in $TSSP);;*)return 1;esac
+}
+
+# assuming this is a good way of checking stuff for existence
+zfs_exist() {
+    # $1: fs path
+    zfs list "$1" >/dev/null 2>&1
+}
+
+check_ncbp_ncsp() {
+    # IN:
+    # $ncbp
+    # $ncsp
+    # $psbm
+    local last_snap_fn
+    # must be both ts or both _
+    if ! { { is_ts "$ncbp" && is_ts "$ncsp"; } || { [ "$ncbp" = _ ] && [ "$ncsp" = _ ]; }; }; then
+        cbpanic "$ZPROP_SD contains illegal values for ncbp or ncsp: $sd"
+        return 1
+    fi
+    if [ $ncbp = $cbp ] && [ $ncsp = $csp ]; then
+        cbpanic "New ncbp@ncsp $ncbp@$ncsp is identical to the current!"
+        return 1
+    fi
+    if [ $ncbp = _ ]; then return 0; fi
+    if [ $psbm != cn ] && [ $psbm != ca ]; then
+        cbpanic "Non-null ncbp or ncsp from noncontrol session $psbm"
+        return 1
+    fi
+    if ! zfs_exist "$base/$CBC/$ncbp@$ncsp"; then
+        cbpanic "Does not exist: $base/$CBC/$ncbp@$ncsp"
+        return 1
+    fi
+    # no pipefail in dash -- special trick needed:
+    if ! last_snap_fn="$(
+{
+    {
+        {
+            $ZFS_LIST_SNAPS "$base/$CBC/$ncbp" 3>&- 4>&-
+            echo $? >&3
+        } | tail -n1 >&4
+    } 3>&1 | {
+        read r
+        exit $r
+    }
+} 4>&1
+)"; then
+        cbpanic "Exception at: $ZFS_LIST_SNAPS $base/$CBC/$ncbp | tail -n1"
+        return 1
+    fi
+    if [ "${last_snap_fn##*@}" != $ncsp ]; then
+        cbpanic "$ncsp is not the last snap under $ncbp; the last snap is ${last_snap_fn##*@}"
+        return 1;
+    fi
+}
+
+parse_kargs() {
+    # IN/OUT:
+    # $csbm
+    # $rebtfs
+    # $builder_mode
+    # $delay
+    local x
+    for x in $(cat /proc/cmdline); do
+        case $x in
+            bootmode=*)
+                csbm=${x#bootmode=}
+                ;;
+            kexeced)
+                rebtfs=y
+        esac
+    done
+    case $csbm in
+        rn|ra|cn|ca)
+        # can't use $BMRE here, which unlike in [[ =~ ]], would be taken as a literal string (even without double quote)
+            ;;
+        builder)
+            builder_mode=y
+            ;;
+        *)
+            cbpanic "Unknown bootmode: $csbm"
+            return 1
+    esac
+    delay=$(echo "$ROOTDELAY"| sed -rn 's,(^[0-9]*$),\1,p')
+    delay=${delay:-0}
+}
+
+# note a difference that can be inferred from return code:
+# 1 - no change to permanent data has occured
+# >1 - some change may have occured
+snap_prev_session() {
+    # IN:
+    # $psbm
+    # $psts
+    # $rbp
+    # $cbp
+    # $base
+    # IN/OUT:
+    # $rsp
+    # $csp
+    case $psbm in
+        rn|cn)
+            snap_normal_session
+            ;;
+        ra|ca)
+            snap_admin_session
+            ;;
+        builder)
+            return 0
+            ;;
+        *)
+            cbpanic "Bug: illegal \$psbm: $psbm"
+            return 1
+    esac
+}
+
+# snapshot the snap type whatever previous mode (applies to snap_admin_session below)
+# -- as the result, a snap type always has a snapshot as long as an auto type has one
+snap_normal_session() {
+    # IN:
+    # $psbm
+    # $psts
+    # $rbp
+    # $cbp
+    # $base
+    local branch
+    local fsls
+    case $psbm in
+        rn)
+            branch="$base/$RBC/$rbp"
+            ;;
+        cn)
+            branch="$base/$CBC/$cbp"
+            ;;
+        *)
+            cbpanic "Bug: illegal \$psbm: $psbm"
+            return 1
+    esac
+    if ! fsls="$($ZFS_LIST_PRESNAP_FSTREE "$branch")"; then
+        cbpanic "Exception at: $ZFS_LIST_PRESNAP_FSTREE $branch"
+        return 1
+    fi
+    echo "$fsls" | loop_snap
+}
+
+loop_snap() {
+    # IN:
+    # $psts
+    local return_val=0
+    while IFS="$TABIFS" read fs mt; do
+        if [ "$mt" != snap ]; then continue; fi
+        if ! $ZFS_SNAP "$fs@$psts"; then
+            cbpanic "Exception at: $ZFS_SNAP $fs@$psts"
+            return 1
+        fi
+    done
+}
+
+snap_admin_session() {
+    # IN:
+    # $psbm
+    # $psts
+    # $rbp
+    # $cbp
+    # $base
+    # IN/OUT:
+    # $rsp
+    # $csp
+    local branch
+    
+    case $psbm in
+        ra)
+            branch="$base/$RBC/$rbp"
+            ;;
+        ca)
+            branch="$base/$CBC/$cbp"
+            ;;
+        *)
+            cbpanic "Bug: illegal \$psbm: $psbm"
+            return 1
+    esac
+    if ! $ZFS_RSNAP "$branch@$psts"; then
+        cbpanic "Exception at: $ZFS_RSNAP $branch@$psts"
+        return 1
+    fi
+    case $psbm in
+        ra)
+            rsp=$psts
+            ;;
+        ca)
+            csp=$psts
+            ;;
+    esac
+}
+
+archive_prev_session() {
+    # IN:
+    # $psbm
+    # $psts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $base
+    local bc
+    local bp
+    local sp
+    local sbc
+    
+    case $psbm in
+        rn)
+            bc="$RBC"
+            bp=$rbp
+            sp=$rsp
+            sbc="$RSBC"
+            ;;
+        cn)
+            bc="$CBC"
+            bp=$cbp
+            sp=$csp
+            sbc="$CSBC"
+            ;;
+        ra|ca|builder)
+            return 0
+            ;;
+        *)
+            cbpanic "Bug: illegal \$psbm: $psbm"
+            return 1
+    esac
+
+    # no error handling for now -- doesn't matter whether successful or not
+    if zfs_exist "$base/$sbc/${bp}_${sp}_$psts"; then
+        $ZFS_RENAME "$base/$sbc/${bp}_${sp}_$psts" "$base/$sbc/archive/${bp}_${sp}_$psts"
+    fi
+}
+
+handle_ncbp_ncsp() {
+    # IN:
+    # $ncbp
+    # $ncsp
+    # OUT:
+    # $cbp
+    # $csp
+    if [ $ncbp = _ ]; then return 0; fi
+    cbp=$ncbp
+    csp=$ncsp
+}
+
+set_sd() {
+    # IN:
+    # $base
+    # $csbm
+    # $csts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    local sd=$csbm:$csts:$rbp:$rsp:$cbp:$csp:_:_
+    if ! $ZFS_SET $ZPROP_SD=$sd "$base"; then
+        cbpanic "Exception at: $ZFS_SET $ZPROP_SD=$sd $base"
+        if [ $sd != "$($ZFS_GET $ZPROP_SD "$base")" ]; then
+            cbpanic "Unable to save system data to $ZPROP_SD at $base. System will be unstable until this is resolved."
+        fi
+    fi       
+}
+
+# When mounting fails, it's possible that
+# some fs are mounted while others are not, and
+# some clones might have been created
+# so clean up after fails
+mount_all() {
+    # IN:
+    # $csbm
+    # $csts
+    # $rbp
+    # $cbp
+    # $rsp
+    # $csp
+    # $base
+    
+    case $csbm in
+        rn|cn)
+            if ! normal_mount_all; then
+                undo_normal_mount_all
+                return 1
+            fi
+            ;;
+        ra|ca)
+            if ! admin_mount_all; then
+                undo_admin_mount_all
+                return 1
+            fi
+            ;;
+        *)
+            cbpanic "Bug: illegal \$csbm: $csbm"
+            return 1
+    esac
+}
+
+normal_mount_all() {
+    __normal_mount_unmount_all clone_mount_fs just_mount_fs
+}
+
+undo_normal_mount_all() {
+    __normal_mount_unmount_all undo_clone_mount_fs just_unmount_fs
+}
+
+__normal_mount_unmount_all() {
+    # $1: clone_mount_fs|undo_clone_mount_fs
+    # $2: just_mount_fs|just_unmount_fs
+    # IN:
+    # $csbm
+    # $csts
+    # $rbp
+    # $cbp
+    # $rsp
+    # $csp
+    # $base
+
+    local bc
+    local bp
+    local sp
+    local sbc
+    local sb
+    local fs dev suid exec mt
+    local b
+    local fsls
+    case $csbm in
+        rn)
+            bc="$RBC"
+            bp=$rbp
+            sp=$rsp
+            sbc="$RSBC"
+            ;;
+        cn)
+            bc="$CBC"
+            bp=$cbp
+            sp=$csp
+            sbc="$CSBC"
+            ;;
+        *)
+            cbpanic "Bug: illegal \$csbm: $csbm"
+            return 1
+    esac
+    b="$base/$bc/$bp"
+    sb="$base/$sbc/${bp}_${sp}_$csts"
+    
+    # https://unix.stackexchange.com/questions/14270/get-exit-status-of-process-thats-piped-to-another/70675#70675
+    # no pipefail in dash -- special trick needed:
+    if ! fsls="$(
+{
+    {
+        {
+            $ZFS_LIST_NPREMNT_FSTREE "$b" 3>&- 4>&-
+            echo $? >&3
+        } | awk -F '\t' "$NSCPT" >&4
+    } 3>&1 | {
+        read r
+        exit $r
+    }
+} 4>&1
+)"; then
+        cbpanic "Exception at: $ZFS_LIST_NPREMNT_FSTREE $b | awk -F '\t' $NSCPT"
+        return 1
+    fi
+    echo "$fsls" | while IFS="," read fs dev suid exec mt; do
+        case "$mt" in
+            auto)
+                if ! $1; then return 1; fi
+                ;;
+            *)
+                if ! $2; then return 1; fi
+                ;;
+        esac
+    done
+}
+
+clone_mount_fs() {
+    # IN:
+    # $fs
+    # $dev
+    # $suid
+    # $exec
+    # $sp
+    # $sb
+    # $b
+    if ! $ZFS_CLONE "$fs@$sp" "$sb${fs#$b}"; then
+        cbpanic "Exception at: $ZFS_CLONE $fs@$sp $sb${fs#$b}"
+        return 1
+    fi
+    if ! [ -d "$ROOTMNT${fs#$b}" ]; then $MKMP "$ROOTMNT${fs#$b}"; fi
+    if ! $ZFS_MOUNT -o $dev,$suid,$exec "$sb${fs#$b}" "$ROOTMNT${fs#$b}"; then
+        cbpanic "Exception at: $ZFS_MOUNT -o $dev,$suid,$exec $sb${fs#$b} $ROOTMNT${fs#$b}"
+        zfs_mounted "$ROOTMNT${fs#$b}"
+    fi    
+}
+
+undo_clone_mount_fs() {
+    # IN:
+    # $fs
+    # $b
+    if ! $ZFS_UNMOUNT "$ROOTMNT${fs#$b}"; then
+        if zfs_mounted "$ROOTMNT${fs#$b}"; then
+            cbpanic "Exception at: $ZFS_UNMOUNT $ROOTMNT${fs#$b}"
+            # hope the user saves the day -- can't do much if unmounting fails
+        fi
+    fi
+    # better just stop here -- and not destroy things
+}
+
+zfs_mounted() {
+    # $1: the mountpoint
+    ls "$1/.zfs" 2>&1
+}
+
+just_mount_fs() {
+    # IN:
+    # $fs
+    # $dev
+    # $suid
+    # $exec
+    # $b
+    if ! [ -d "$ROOTMNT${fs#$b}" ]; then $MKMP "$ROOTMNT${fs#$b}"; fi
+    if ! $ZFS_MOUNT -o $dev,$suid,$exec "$fs" "$ROOTMNT${fs#$b}"; then
+        cbpanic "Exception at: $ZFS_MOUNT -o $dev,$suid,$exec $fs $ROOTMNT${fs#$b}"
+        zfs_mounted "$ROOTMNT${fs#$b}"
+    fi  
+}
+
+just_unmount_fs() {
+    # IN:
+    # $fs
+    # $b
+    if ! $ZFS_UNMOUNT "$ROOTMNT${fs#$b}"; then
+        if zfs_mounted "$ROOTMNT${fs#$b}"; then
+            cbpanic "Exception at: $ZFS_MOUNT $fs $ROOTMNT${fs#$b}"
+            # hope the user saves the day -- can't do much if unmounting fails
+        fi
+    fi  
+}
+
+admin_mount_all() {
+    # IN:
+    # $csbm
+    # $base
+    # $rbp
+    # $cbp
+    __admin_mount_unmount_all just_mount_fs
+}
+
+undo_admin_mount_all() {
+    # IN:
+    # $csbm
+    # $base
+    # $rbp
+    # $cbp
+    __admin_mount_unmount_all just_unmount_fs
+}
+
+__admin_mount_unmount_all() {
+    # $1: just_mount_fs|just_unmount_fs
+    # IN:
+    # $csbm
+    # $base
+    # $rbp
+    # $cbp
+    local b
+    local fs dev suid exec 
+    local fsls
+    case $csbm in
+        ra)
+            b="$base/$RBC/$rbp"
+            ;;
+        ca)
+            b="$base/$CBC/$cbp"
+            ;;
+        *)
+            cbpanic "Bug: illegal \$csbm: $csbm"
+            return 1
+    esac
+    # no pipefail in dash -- special trick needed:
+    if ! fsls="$(
+{
+    {
+        {
+            $ZFS_LIST_APREMNT_FSTREE "$b" 3>&- 4>&-
+            echo $? >&3
+        } | awk -F '\t' "$ASCPT" >&4
+    } 3>&1 | {
+        read r
+        exit $r
+    }
+} 4>&1
+)"; then
+        cbpanic "Exception at: $ZFS_LIST_APREMNT_FSTREE $b | awk -F '\t' $ASCPT"
+        return 1
+    fi
+    echo "$fsls" | while IFS="," read fs dev suid exec; do
+        if ! $1; then
+            return 1
+        fi
+    done
+}
+
+create_fs() {
+    # $1: path
+    if ! $ZFS_CREATE "$1"; then
+        cbpanic "Exception at: $ZFS_CREATE $1"
+        return 1
+    fi
+}
+
+# run after snapshot has been taken so that rsp/csp is up to date
+update_bootfs() {
+    # IN:
+    # $psbm
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $base
+    local bp
+    local sp
+    local bc
+    local bootfs
+    local orig
+    local origbp
+    local origsp
+    case $psbm in
+        ra)
+            bp=$rbp
+            sp=$rsp
+            bc="$RBC"
+            bootfs=regular
+            ;;
+        ca)
+            bp=$cbp
+            sp=$csp
+            bc="$CBC"
+            bootfs=control
+            ;;
+        *)
+            cbpanic "Bug: unexpected \$psbm: $psbm"
+            return 1
+    esac
+    # instead of destroying the old bootfs, we try to rename it
+    if orig="$($ZFS_GET origin "$base/boot/$bootfs")"; then
+        orig="${orig##*/}"
+        # no replacement as in bash, so:
+        origbp="${orig%%@*}"
+        origsp="${orig#*@}"
+        $ZFS_RENAME "$base/boot/$bootfs" "$base/boot/${bootfs}_${origbp}_$origsp" ||
+            zfs destroy "$base/boot/$bootfs"
+    else
+        zfs destroy "$base/boot/$bootfs"
+    fi
+    if ! $ZFS_CLONE "$base/$bc/$bp/boot@$sp" "$base/boot/$bootfs"; then
+        cbpanic "Exception at: $ZFS_CLONE $base/$bc/$bp/boot@$sp $base/boot/$bootfs
+If manual retries fail, try to rename '$base/boot/$bootfs$ctime' back to '$base/boot/$bootfs'"
+        if ! zfs_exist "$base/boot/$bootfs"; then
+            cbpanic "'$base/boot/$bootfs' does not exist; 
+System will not be able to boot into the corresponding mode."
+        fi
+    fi
+}
+
+check_refresh_kernel() {
+    # IN:
+    # $psbm
+    # $rbp
+    # $cbp
+    # $base
+    # $csbm
+    # $csp
+    # $ncbp
+    local bp
+    local bc
+    local bootfs
+    local bootfs_orgn
+    local return_val
+    
+    case $psbm in
+        ra)
+            bp=$rbp
+            bc="$RBC"
+            bootfs=regular
+            ;;
+        ca)
+            # if we got new pointers, assume the control bootfs has already
+            # been updated accordingly
+            if [ $ncbp != _ ]; then return 0; fi
+            bp=$cbp
+            bc="$CBC"
+            bootfs=control
+            ;;
+        rn|cn|builder)
+            return 0
+            ;;
+        *)
+            cbpanic "Bug: illegal \$psbm: $psbm"
+            return 1
+    esac
+    
+    if ! bootfs_orgn="$($ZFS_GET origin "$base/boot/$bootfs")"; then
+        cbpanic "Exception at: $ZFS_GET origin $base/boot/$bootfs"
+    fi
+    if [ "${bootfs_orgn%@*}" != "$base/$bc/$bp/boot" ]; then
+        cbpanic "Unexpected origin branch of $base/boot/$bootfs: ${bootfs_orgn%@*}"
+        return 1
+    fi
+
+    if ! [ -d /mnt ]; then
+        if ! mkdir /mnt; then
+            return 1
+        fi
+    fi
+    if ! $ZFS_MOUNT -o ro "${bootfs_orgn%@*}" /mnt; then
+        cbpanic "Exception at: $ZFS_MOUNT -o ro ${bootfs_orgn%@*} /mnt"
+        return 1
+    fi
+    
+    kupdated
+    case $? in
+        0)
+            # updated
+            if sameside; then
+                refresh_kernel
+                # if we reach here, kexec has failed
+                if [ $? -eq 1 ]; then
+                    return_val=3
+                fi
+            else
+                return_val=2
+            fi
+            ;;
+        1)
+            # not updated
+            return_val=0
+            ;;
+        *)
+            # something aweful has happened
+            return_val=1
+    esac
+    if ! $ZFS_UNMOUNT /mnt; then
+        cbpanic "Exception at: $ZFS_UNMOUNT /mnt"
+        return 1
+    fi
+    return $return_val
+}
+
+sameside() {
+    # IN:
+    # $psbm
+    # $csbm
+    case "$psbm$csbm" in
+        r[na]r[na]|c[na]c[na])
+            return 0
+            ;;
+        *)
+            return 1
+    esac
+}
+
+kupdated() {
+    # IN:
+    # $base
+    # $bp
+    # $bc
+    # $bootfs_orgn
+
+    # could do some sophisticated checks here,
+    # like kernel intergrity, initramfs not destroying zfs stuff ...
+    # (start with /etc/grub.d/10_linux beginning ln 293)
+    # but going minimal first -- so not these:
+    #
+    # local chngls
+    # if ! chngls="$($ZFS_DIFF "$bootfs_orgn" "$base/$bc/$bp/boot")"; then
+    #     cbpanic "Exception at: $ZFS_DIFF $bootfs_orgn $base/$bc/$bp/boot"
+    #     return 3
+    # fi
+    # echo "$chngls" | while IFS="$TABIFS" read ict ct ft path misc; do :; done
+    #
+    #
+    # $ZFS_GET "written@${bootfs_orgn##*@}" "$base/$bc/$bp/boot" is unreliable:
+    # sometimes no changes are make and yet 8kb-64kb is used
+    # -- probably due to relatime
+    # 
+    # not really sure about the semantics of zfs diff
+    # but it seems to detect changes reliably
+    local chng
+    if ! chng="$($ZFS_DIFF "$bootfs_orgn" "$base/$bc/$bp/boot")"; then
+        cbpanic "Exception at: $ZFS_DIFF $bootfs_orgn $base/$bc/$bp/boot"
+        return 2
+    fi
+    echo "$chng" | grep -E 'vmlinuz|initrd|initramfs' >/dev/null
+}
+
+refresh_kernel() {
+    if ! kexec -l /mnt/vmlinuz --initrd=/mnt/initrd.img --command-line="kexeced $(cat /proc/cmdline)"; then
+        return 1
+    fi
+    # maybe check /proc/self/mountinfo and unmount things recursively?
+    if ! kexec -e; then
+        return 1
+    fi
+    # if successfully kexeced, shouldn't reach here.
+}
+
+simply_mountroot() {
+    # IN:
+    # $base
+    local fsls
+    local fs dev suid exec
+    local b="$base/$BDRTFS"
+    # no pipefail in dash -- special trick needed:
+    if ! fsls="$(
+{
+    {
+        {
+            $ZFS_LIST_APREMNT_FSTREE "$b" 3>&- 4>&-
+            echo $? >&3
+        } | awk -F '\t' "$ASCPT" >&4
+    } 3>&1 | {
+        read r
+        exit $r
+    }
+} 4>&1
+)"; then
+        cbpanic "Exception at: $ZFS_LIST_APREMNT_FSTREE $b | awk -F '\t' $ASCPT"
+        return 1
+    fi
+    echo "$fsls" | while IFS="," read fs dev suid exec; do
+        if ! just_mount_fs; then return 1; fi
+    done
+}
+
+# adapted from /usr/share/initramfs-tools/scripts/zfs
+# from package zfs-initramfs (probably 0.6.5.6-0ubuntu18)
+import_pool() {
+    # IN:
+    # $pool
+    # $delay
+    # $csbm
+    local op
+    case $csbm in
+        rn|ra)
+            # pass -L to zpool import only if you have zfs-unlimited
+            # op=-L
+            op=
+    esac
+    
+    local stat=
+    local ac=0
+    wait_for_udev
+    modprobe zfs zfs_autoimport_disable=1
+    while ! try_import_pool && [ $ac -lt $delay ]; do
+        ac=$((ac+1))
+        /bin/sleep 1
+    done
+    if [ "$stat" != ONLINE ]; then
+        cbpanic "Unable to import $pool; try to do it manually.
+Hint: Try:  zpool import -f -R / -N $pool"
+        if ! [ "$($ZFS_HEALTH "$pool")" = ONLINE ]; then
+            return 1
+        fi
+    fi
+
+    local i
+        
+    # Not sure why this is necessary.
+    # On my test system the scheduler file already contains the following:
+    # noop deadline [cfq]
+    
+    # The snippet below is taken directly from
+    # https://github.com/ubuntu/zfs/blob/master/contrib/initramfs/scripts/zfs.in
+    # Copyright belongs to the respective authors.
+
+    #######################################################
+    # Set elevator=noop on the root pool's vdevs' disks.  ZFS already
+    # does this for wholedisk vdevs (for all pools), so this is only
+    # important for partitions.
+    zpool status -L "$pool" 2>/dev/null |
+        awk '/^\t / && !/(mirror|raidz)/ {
+                        dev=$1;
+                        sub(/[0-9]+$/, "", dev);
+                        print dev
+                }' |
+        while read i
+        do
+            if [ -e "/sys/block/$i/queue/scheduler" ]
+            then
+                echo noop > "/sys/block/$i/queue/scheduler"
+            fi
+        done
+    #######################################################
+}
+
+try_import_pool() {
+    # IN:
+    # $pool
+    # $op
+    # IN/OUT:
+    # $stat
+    if ! $ZFS_IMPORT $op "$pool"; then
+        return 1
+    fi
+    if ! stat="$($ZFS_HEALTH "$pool")"; then
+        cbpanic "Exception at: $ZFS_HEALTH $pool"
+    fi
+    [ "$stat" = ONLINE ]
+}
+
+mountroot() {
+    local pool # the $pool from grub.cfg
+    local basefs # the $basefs from grub.cfg
+    local base # $pool/$basefs
+    local psts # unix time stamp of previous session
+    local psbm # bootmode of previous session
+    local csts # unix time stamp of current session
+    local csbm # the bootmode kernel parameter from grub.cfg
+    local rbp # regular branch pointer
+    local rsp # regular snapshot pointer
+    local cbp # control branch pointer
+    local csp # control snapshot pointer
+    local ncbp # new control branch pointer
+    local ncsp # new control snapshot pointer
+    local rebtfs # if y, then need to update file system under $base/boot
+    local kexec_failed=n
+    local builder_mode=n # if y, then we are still building the system
+    local zfsarg="${ROOT#ZFS=}"
+    local delay
+    local return_val
+    
+    # routine begins
+    [ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-top"
+    run_scripts /scripts/local-top
+    [ "$quiet" != "y" ] && log_end_msg
+
+    [ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-premount"
+    run_scripts /scripts/local-premount
+    [ "$quiet" != "y" ] && log_end_msg
+    # routine ends
+    
+    pool="$(echo "$zfsarg" | sed -rn 's,/.*,,p')"
+    basefs="$(echo "$zfsarg" | sed -rn 's,^[^/]+/([^$/]+).*,\1,p')"
+    if [ -z "$pool" ] || [ -z "$basefs" ]; then
+        cbpanic "Unable to parse root_karg: $ROOT";
+        unset_globals
+        return 1
+    fi
+    base="$pool/$basefs"
+    
+    csts=$(unixts)
+    if ! is_ts $csts; then
+        cbpanic "Invalid \$csts: $csts"
+        unset_globals
+        return 1
+    fi
+    
+    if ! parse_kargs; then
+        unset_globals
+        return 1
+    fi
+    # now have:
+    # $csbm
+    # $rebtfs
+    # $builder_mode
+    # $delay
+    
+    if ! import_pool; then
+        unset_globals
+        return 1
+    fi
+    
+    if [ "$builder_mode" = y ]; then
+        simply_mountroot
+        return_val=$?
+        unset_globals
+        return $return_val
+    fi
+    
+    if ! get_sd; then
+        unset_globals
+        return 1
+    fi
+    # now have:
+    # $psbm
+    # $psts
+    # $rbp
+    # $rsp
+    # $cbp
+    # $csp
+    # $ncbp
+    # $ncsp
+    
+    if [ -z $rebtfs ]; then
+        check_refresh_kernel
+        case $? in
+            0)
+                # kernel not updated
+                ;;
+            2)
+                # kernel updated but unnecessary to kexec
+                rebtfs=y
+                ;;
+            3)
+                kexec_failed=y
+                rebtfs=y
+                ;;
+            *)
+                # something aweful has happened
+                unset_globals
+                return 1
+        esac
+    fi
+            
+    snap_prev_session
+    case $? in
+        0)
+            if [ "$rebtfs" = y ]; then
+                update_bootfs
+            fi
+            ;;
+        *)
+            # something aweful has happened
+            unset_globals
+            return 1
+    esac
+
+    archive_prev_session
+
+    # Now that previous session has been taken care of, update cbp and csp if
+    # previous session has specified new values for them (if a control session has
+    # "branched under the foot"):
+    handle_ncbp_ncsp
+
+    # Update sd so that in case of a premature return at the failure of mount_all,
+    # the next session does't get confused:
+    set_sd
+
+    # Now that the current session has finished minimally,
+    # reboot so that the next session can use the new kernel 
+    if [ $kexec_failed = y ]; then
+        reboot || {
+            cbpanic "kexec and reboot both failed. Try 'shutdown'."
+            unset_globals
+            return 1
+        }
+    fi
+
+    # The init script in initramfs (/usr/share/initramfs-tools/init) checks for
+    # the real init to call (one of /sbin/init /etc/init /bin/init /bin/sh -- still
+    # under ${rootmnt} == /root) using validate_init(), after mountroot has returned.
+    # So mount_all needs to properly unmount after a fail so that run-init also fails.
+    if ! mount_all; then
+        unset_globals
+        return 1
+    fi
+    
+    unset_globals
+
+    # routine begins
+    [ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-bottom"
+    run_scripts /scripts/local-bottom
+    [ "$quiet" != "y" ] && log_end_msg
+    # routine ends
+}
+
+unset_globals() {
+    unset ROOTMNT
+    unset ZPROP_SD
+    unset ZPROP_MT
+    unset RBC
+    unset CBC
+    unset RSBC
+    unset CSBC
+    unset TSSP
+    unset ZFS_CREATE
+    unset ZFS_LIST_PRESNAP_FSTREE
+    unset ZFS_LIST_NPREMNT_FSTREE
+    unset NSCPT
+    unset ZFS_LIST_APREMNT_FSTREE
+    unset ASCPT
+    unset ZFS_GET
+    unset ZFS_SET
+    unset ZFS_SNAP
+    unset ZFS_RSNAP
+    unset ZFS_CLONE
+    unset ZFS_MOUNT
+    unset ZFS_UNMOUNT
+    unset ZFS_DIFF
+    unset ZFS_RENAME
+    unset ZFS_IMPORT
+    unset ZFS_HEALTH
+    unset MKMP
+    unset TABIFS
+}

@@ -1,0 +1,28 @@
+#!/bin/sh
+
+# zfs_custom_boot_hook
+
+# This script goes to:
+# /etc/initramfs-tools/hooks
+
+# make sure it's executable!
+
+PREREQ=""
+
+prereqs()
+{
+        echo "$PREREQ"
+}
+
+case $1 in
+# get pre-requisites
+prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+cp -p "${CONFDIR}/scripts/zfs_custom_boot" "${DESTDIR}/scripts/zfs_custom_boot"
+copy_exec /sbin/kexec

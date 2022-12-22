@@ -1,0 +1,23 @@
+#!/bin/bash
+
+. params.sh # get $POOL and other params from there
+
+zpool status "$POOL" >/dev/null 2>&1 && {
+    echo "'$POOL' already exists"
+    exit 1
+}
+
+touch /dev/shm/tmppooldev
+truncate -s $DEV_SIZE /dev/shm/tmppooldev
+zpool create -o cachefile=none -o ashift=12 -O atime=off -O canmount=off -O compression=lz4 -O normalization=formD -O mountpoint=none -o comment=temporary "$POOL" /dev/shm/tmppooldev
+zfs create -o mountpoint=legacy -o canmount=off "$POOL/$BASE_FS"
+zfs create -o mountpoint=legacy -o local:mgmt-type=auto "$POOL/$BASE_FS/root"
+zfs create -o mountpoint=legacy -o local:mgmt-type=auto "$POOL/$BASE_FS/root/boot"
+zfs create -o mountpoint=legacy -o local:mgmt-type=auto "$POOL/$BASE_FS/root/var"
+zfs create -o mountpoint=legacy -o local:mgmt-type=snap "$POOL/$BASE_FS/root/home"
+
+# check with:
+# sudo zfs list -oname,atime,canmount,compression,normalization,mountpoint,devices,setuid,exec,local:mgmt-type
+
+zpool export "$POOL"
+

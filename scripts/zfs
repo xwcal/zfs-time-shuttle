@@ -1,0 +1,19 @@
+# zfs
+
+# This script goes to:
+# /etc/initramfs-tools/conf.d
+
+# It masks:
+# /usr/share/initramfs-tools/conf.d/zfs
+# and gets called at line 75 of init
+
+# See /usr/sbin/mkinitramfs:262
+
+for x in $(cat /proc/cmdline)
+do
+    case $x in
+        root=ZFS=*)
+            BOOT=zfs_custom_boot
+            ;;
+    esac
+done

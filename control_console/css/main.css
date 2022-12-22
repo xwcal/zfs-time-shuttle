@@ -1,0 +1,298 @@
+/*
+CDDL HEADER START
+
+This file and its contents are supplied under the terms of the
+Common Development and Distribution License ("CDDL"), version 1.0.
+You may only use this file in accordance with the terms of version
+1.0 of the CDDL.
+
+A full copy of the text of the CDDL should have accompanied this
+source.  A copy of the CDDL is also available via the Internet at
+https://www.opensource.org/licenses/CDDL-1.0
+
+CDDL HEADER END
+
+Copyright (C) 2019 Xiao Wan
+*/
+
+/*
+Copyright (c) HTML5 Boilerplate
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+/*
+ * Borrowed from:
+ * https://github.com/h5bp/html5-boilerplate/blob/master/dist/css/main.css
+ */
+html {
+    color: rgba(36,73,73,1);
+    font-size: 2.5vmin;
+    word-break: keep-all; /* "Word breaks should not be used for Chinese/Japanese/Korean (CJK) text. Non-CJK text behavior is the same as for normal." */
+    /* My note: 
+     * to allow CJK text to line break properly, add white space to where breaks are desired. 
+     * See also:
+     * https://stackoverflow.com/questions/13224062/html-change-line-break-trigger
+     * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/wbr
+     */
+}
+
+/*
+ * Dynamic three pane with just CSS -- simpler than javascript solution:
+ * https://stackoverflow.com/questions/6654958/make-body-have-100-of-the-browser-height
+ * https://stackoverflow.com/questions/6582439/how-to-split-screen-with-three-divs
+ */
+html,body {
+    height: 100%;
+    width: 99%; /* 100% would give a horizontal scroll bar */
+    overflow: hidden; /* https://stackoverflow.com/questions/28411499/disable-scrolling-on-body */
+}
+
+/* for step1 and step2 */
+#message {
+    width: 100%;
+    text-align: center;
+}
+
+/* for confirm_revert */
+#message.multiline {
+    white-space: pre;
+}
+
+/* for final success/fail */
+#message > p {
+    font-size: 5vh;
+}
+
+#display {
+    height: 85%;
+    width: 100%;
+}
+
+#display>div {
+    float: left;
+    height: 100%;
+    width: 33%;
+    overflow: auto;
+    border-top-style: solid;
+    border-left-style: solid;
+    border-bottom-style: solid;
+    border-width: thin;
+    border-color: lightgrey;
+}
+
+/*
+ * Works with fixed height div containers with overflow=auto (or scroll) as above
+ * to give tables scrollable bodies but fixed headers (that auto align with body columns -- 'display:blocked' on body and header messes up alignment)
+ * Found here:
+ * https://stackoverflow.com/questions/4709390/table-header-to-stay-fixed-at-the-top-when-user-scrolls-it-out-of-view-with-jque/43786376#43786376
+ */
+thead {
+    position: sticky;
+    top: 0px;
+    /* background: rgba(182,255,255,1); */
+    background: rgba(36,73,73,1);
+    color: white;
+}
+
+thead td {
+    text-align: center;
+}
+
+#sn_switch {
+    position: sticky;
+    width: 100%;
+    top: 0px;
+    /* background: rgba(182,255,255,1); */
+    background: rgba(36,73,73,1);
+    color: white;
+    font-size: 1rem;
+    height: 3%; /* a little extra height, with color inversion and vertical-align: bottom for span.chosen, creates tab effect */
+}
+
+#sn_switch > span {
+    width: 49%;
+    display: inline-block;
+    text-align: center;
+    line-height: 1;
+    cursor: pointer;
+}
+
+#sn_switch > span.chosen {
+    background: white;
+    color: rgba(36,73,73,1);
+    vertical-align: bottom;
+    cursor: default;
+}
+
+/* 
+ * The last table column to use all remaining width. Found here:
+ * https://stackoverflow.com/a/16137888
+ */
+td:last-child {
+    width: 100%;
+    text-align: center;
+    white-space: nowrap; /* "suppresses line breaks" for creation column */
+}
+
+tr {
+    font-size: 1rem;
+    line-height: 1;
+}
+
+tbody > tr {
+    cursor: pointer;
+}
+
+tbody > tr:hover > td:first-child {
+    background: rgba(182,255,182,1);
+}
+
+/* Mark selected names and color legend:  */
+tbody > tr.rbp > td:first-child, span.rbp {
+    text-decoration: underline overline rgba(219,146,109,1);
+}
+tbody > tr.rsp > td:first-child, span.rsp {
+    text-decoration: underline overline rgba(219,146,109,1);
+}
+tbody > tr.selected > td:first-child, span.selected {
+    background: rgba(0, 220, 0, 1);
+}
+
+span {
+    white-space: nowrap; /* also suppress line break within legend */
+}
+
+/* 
+ * radio input causes alignment issues that are hard to fix:
+ * it seems to be ignored when the table column width is calculated, and
+ * it causes the label text to be lowered (in my case) or raised:
+ * https://stackoverflow.com/questions/13509883/how-to-vertically-align-a-html-radio-button-to-its-label
+ * So, just make it disappear all together, and use javascript's querySelector with input:checked 
+ * and apply styling to ancestor tr (can't do in pure CSS -- there is only a + to select the next sibling)
+ * and querySelectorAll with input:not(checked) to reset the deselected item ...
+ * Ahh, why not go pure javascript instead:
+ * https://stackoverflow.com/questions/11297339/jquery-selector-slow-when-1000-elements-with-450mhz-machine
+ */
+/*
+input {
+    display:none;
+}
+*/
+
+#sn_switch + div {
+    height: 96%; /* with #sn_switch's 3%, add up to 99% -- instead of 100% to avoid vertical scroll bar */
+    width: 100%;
+}
+
+#svg_box {
+    height:100%;
+    width: 100%;
+}
+
+stop {
+    stop-color: rgba(36,73,73,1);
+}
+
+path.mark {
+    stroke: rgba(36,73,73,1);
+}
+
+path.bsh, path.ssh {
+    stroke-width: 10;
+    stroke: rgba(0, 220, 0, 0.5);
+}
+
+path.bhh {
+    stroke-width: 10;
+    stroke: url(#bhhg);
+}
+
+#bhhg > stop {
+    stop-color: rgba(182,255,182,1);
+}
+
+path.shh {
+    stroke-width: 10;
+    stroke: rgba(182,255,182,1);
+}
+
+#note_box {
+    white-space: pre-wrap; /* obey newlines and wrap as necessary */
+    overflow-wrap: break-word; /* break word if too long to fit */
+}
+
+
+/*
+ * "clearfix":
+ * https://developer.mozilla.org/en-US/docs/Web/CSS/clear
+ */
+#display::after { 
+    content: "";
+    display: block; 
+    clear: both;
+}
+
+#button_row {
+    width: 97%;
+    padding: 1%;
+}
+
+
+/*
+ *Borrowed from:
+ *https://developer.mozilla.org/en-US/docs/Web/HTML/Element/button
+ */    
+button {
+    border: 0;
+    line-height: 2;
+    padding: 0 1%;
+    font-size: 1rem;
+    text-align: center;
+    color: #fff;
+    border-radius: 5px;
+    margin-left: 2%;
+    float: right;
+}
+
+button.enabled {
+    background-color: rgba(0, 220, 0, 1);
+}
+
+button.disabled {
+    background-color: rgba(182, 182, 182, 1);
+}
+
+button.enabled:hover {
+    background-color: rgba(0, 255, 0, 1);
+}
+
+button.enabled:active {
+    box-shadow: inset -2px -2px 3px rgba(255, 255, 255, .6),
+                inset 2px 2px 3px rgba(0, 0, 0, .6);
+}
+
+button:last-child {
+    float: right;
+}
+
+
+div.debug {
+    display: none;
+}

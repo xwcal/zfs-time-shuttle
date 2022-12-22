@@ -1,0 +1,88 @@
+#! /bin/sh
+set -e
+
+# This script creates hardlinks in /boot to the latest kernel image and initramfs so that
+# my custom grub.cfg can enjoy the simplicity of using fixed names.
+
+# The script improves upon the previous version (renamed zz-update-grub.old).
+
+# It replaces (the two are identical):
+# /etc/kernel/postinst.d/zz-update-grub
+# /etc/kernel/postrm.d/zz-update-grub
+
+if type systemd-detect-virt >/dev/null 2>&1 &&
+   systemd-detect-virt --quiet --container; then
+	exit 0
+fi
+
+bd=/boot
+
+ver=
+
+set_latest() {
+    local vmlinuz_prefix="${bd}/vmlinuz-"
+    local initrd_prefix="${bd}/initrd.img-"
+    local x
+    local all_vers="$(for x in ${vmlinuz_prefix}*; do echo "${x#$vmlinuz_prefix}"; done | linux-version sort --reverse)"
+    ver=
+    [ "$all_vers" != '*' ] || exit 1
+    set -- $all_vers
+    while [ -n "$1" ]; do
+        if [ -f "$initrd_prefix$1" ]; then
+            ver=$1
+            break
+        fi
+        shift
+    done
+    [ -n "$ver" ] || exit 1
+    vmlinuz_link="${bd}/vmlinuz"
+    vmlinuz_file="${bd}/vmlinuz-$ver"
+    initrd_link="${bd}/initrd.img"
+    initrd_file="${bd}/initrd.img-$ver"
+}
+
+vmlinuz_ok() {
+    link_ok "$vmlinuz_file" "$vmlinuz_link"
+}
+
+initrd_ok() {
+    link_ok "$initrd_file" "$initrd_link"
+}
+
+link_ok() {
+    # will return false if either file is absent (no need for -f)
+    [ "$1" -ef "$2" ]
+}
+
+link_vmlinuz() {
+    ln -f "$vmlinuz_file" "$vmlinuz_link" || exit 1
+}
+
+link_initrd() {
+    ln -f "$initrd_file" "$initrd_link" || exit 1
+}
+
+do_linking() {
+    set_latest
+    if ! vmlinuz_ok; then
+        link_vmlinuz
+    fi
+    if ! initrd_ok; then
+        link_initrd
+    fi
+}
+
+set -- $DEB_MAINT_PARAMS
+mode="${1#\'}"
+mode="${mode%\'}"
+case $0:$mode in
+    # Only run on postinst configure and postrm remove, to avoid wasting
+    # time by calling update-grub multiple times on upgrade and removal.
+    # Also run if we have no DEB_MAINT_PARAMS, in order to work with old
+    # kernel packages.
+    */postinst.d/*:|*/postinst.d/*:configure|*/postrm.d/*:|*/postrm.d/*:remove)
+	do_linking
+	;;
+esac
+
+exit 0
