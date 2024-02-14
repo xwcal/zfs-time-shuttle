@@ -48,90 +48,9 @@ If something goes wrong in a normal session, say /usr gets deleted, the next nor
 By design, a revert doesn't destroy any existing state. You pick a good snapshot on a `/` branch and a good snapshot on a `/home` branch as shown in the demo below, and ZTS will create a new state by branching off at those snapshots:
 ![demo animation](../2cbbd50198cbbe7c1af9fd4992ad35c97cc7e86e/demo.gif)
 
-## Getting Started (for the tech savvy)
+## Getting Started
 
-CAUTION:
-A ZTS based system is not nearly as easy to set up as it is to maintain (unless you have a system that is already set up in which case simply replicate using zfs send/recv and run a few more commands). Whereas maintaining ZTS is an end user's job, setting is up is more like an OEM/livecd packer's job. If you are new to linux the following steps might be too difficult to follow. Otherwise, it's recommended you perform the following steps in a virtual environment, and replicate the result to bare metal afterwards. I am writing everything from 3+ year old memory and notes scattered in many places so the instructions are very beta. Proceed at your own risk. However, I will try my best to help if you have tried your best :)
-
-You need to change `rpool` to your pool name in `grub.cfg` (line 1) and `control_console/sh/defs.sh` (line 6) if your pool name is different. 
-
-Similarly, the name of the base file system, by default `ubuntu`, can be customized in `grub.cfg` (line 2) and `control_console/sh/defs.sh` (line 6).
-
-In the steps below, `rpool` and `ubuntu` are assumed. We also assume you have the MBR partition scheme on a single hard drive and ZFS occupies the first partition.
-
-### Steps
-#### Build your system, rooting on ZFS
-Follow OpenZFS's "Root on ZFS" tutorial that matches your desired Linux flavor, except the following datasets should be used instead, with the corresponding mountpoints:
-```
-rpool/ubuntu/root	on	/
-rpool/ubuntu/root/boot	on	/boot
-rpool/ubuntu/root/home	on	/home
-```
-In the Linux world, the overloaded "root" can be a source of confusion. Here `root` means the root of the "two sided tree" as discussed above.
-
-When the build is complete, (if you are working in a virtual environment, create a save point first, then) proceed with the following (still in the chroot environment):
-
-#### Generate custom initramfs
-
-Install `kexec-tools` so that `/sbin/kexec` is available for our custom initramfs.
-
-Copy the following files under `scripts/` to their designated places (see comments inside files):
-```
-  zfs
-  zfs_custom_boot
-  zfs_custom_boot_hook
-```
-
-Generate the initramfs:
-```
-# update-initramfs -uv -k <your kernel release>
-```
-Note since you are building your system in a chroot environment, `<your kernel release>` isn't necessarily the same as the output of `uname -r`.
-
-#### Prepare grub and `/boot`
-We want a custom `core.img` file (stage 1.5) that takes the boot process to the `grub.cfg` on the current `/boot` of the control side (see
-Design
-above), so run this command to generate one (the output is not yet used):
-```
-# grub-mkimage --verbose --directory=/usr/lib/grub/i386-pc --prefix='(hd0,msdos1)/ubuntu/boot/control@/grub' --output=/boot/grub/i386-pc/core.img --format=i386-pc --compression=auto  zfs part_msdos biosdisk
-```
-
-Also, copy the custom `grub.cfg` to `/boot/grub/`, and create hardlinks `vmlinuz` and `initrd.img` under `/boot` to the kernel and initramfs, respectively. 
-
-#### Hold grub still
-Because grub serves as the fixed link that carries the boot process towards ZTS, if anything changes the link the boot process will fail.
-Without concerning ourselves with grub integration, the simplest solution is to hold all grub related components still when the build is over.
-On my ubuntu 18.04 I did:
-```
-# apt-mark hold grub-pc
-# apt-mark hold grub-pc-bin
-# apt-mark hold grub-common
-# apt-mark hold grub2-common
-# apt-mark hold grub-gfxpayload-lists
-```
-
-#### Reboot
-Hopefully when the machine reboots, you see the custom grub menu with these options:
-```
-Normal
-Admin
-Recovery
-```
-None of these works yet, so move the cursor quickly to cancel the timeout or you will end up in a grub error screen and have to reboot.
-
-Move the cursor to `Recovery` and press `e` to edit the entry, replacing `${bootfs}` with `/ubuntu/root/boot` on the `linux` line and `initrd` line. This tells grub to find the kernel and initramfs where they currently reside: `/ubuntu/root/boot`.
-
-Finally `ctrl+x` to continue to boot. The custom initramfs you generated previously will work to set up the ZTS structure.
-
-#### Put the custom core.img in place
-Once the boot completes, run this command to put `core.img` in place (in the "MBR gap"):
-```
-# grub-bios-setup --verbose --directory='/boot/grub/i386-pc/' /dev/sda
-```
-
-#### Add control console
-
-It's really up to you how to set it up. Maybe add a systemd unit to run the server on boot, then a shortcut to open `127.0.0.1:8000` in the browser.
+(It's been a long time since 2018 and a lot of things happened. Grub's zfs.mod no longer follows ZFS's evolution, and even the grub2 compatibility mode seems to fail occasionally as reported [here](https://bugs.launchpad.net/ubuntu/+source/grub2/+bug/2041739) and [here](https://bugs.launchpad.net/ubuntu/+source/grub2/+bug/2047173). This section needs to be rewritten from scratch. Please stay tuned.)
 
 ## Possible Improvements/Wishlist
 Having come from the Windows world and remembering the early days when improper shutdowns were likely to cause consistency issues, when designing ZTS, I decided to be conservative. However, it's easy to add a few commands to allow mid-session snapshots.
